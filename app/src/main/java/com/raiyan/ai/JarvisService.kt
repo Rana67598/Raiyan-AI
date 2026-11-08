@@ -129,7 +129,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
 
     private fun handleSpokenText(text: String) {
         val lower = text.lowercase()
-        val hasWakeWord = lower.contains("জারভিস") || lower.contains("যারভিস") || lower.contains("jarvis")
+        val hasWakeWord = lower.contains("জার্ভিস") || lower.contains("জারভিস") || lower.contains("যারভিস") || lower.contains("ভিস") || lower.contains("jarvis")
 
         if (!isAwaitingCommand) {
             if (hasWakeWord) {
