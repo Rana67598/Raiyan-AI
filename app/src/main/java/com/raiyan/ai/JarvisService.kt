@@ -1,6 +1,7 @@
 package com.raiyan.ai
 
 import android.app.*
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.hardware.camera2.CameraManager
@@ -9,10 +10,10 @@ import android.net.Uri
 import android.os.*
 import android.provider.Settings
 import android.speech.RecognitionListener
+import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -39,15 +40,15 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isAwaitingCommand = false
     private var isSpeaking = false
-    private var lastActivityTime = System.currentTimeMillis()
+    private var lastMicStartTime = 0L
 
-    // Watchdog: মাইক্রোফোন ১০ সেকেন্ডের বেশি আটকে থাকলে অটোমেটিক রিস্টার্ট করবে
-    private val watchdogRunnable = object : Runnable {
+    private val micWatchdog = object : Runnable {
         override fun run() {
-            if (!isSpeaking && System.currentTimeMillis() - lastActivityTime > 10000) {
+            val actuallySpeaking = tts?.isSpeaking == true
+            if (!isSpeaking && !actuallySpeaking && (System.currentTimeMillis() - lastMicStartTime > 7000)) {
                 startListening()
             }
-            mainHandler.postDelayed(this, 5000)
+            mainHandler.postDelayed(this, 3500)
         }
     }
 
@@ -55,7 +56,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         super.onCreate()
         startNotification()
         acquireWakeLock()
-        tts = TextToSpeech(this, this)
+        tts = TextToSpeech(this, this, "com.google.android.tts")
 
         triggerDirectCommand = {
             mainHandler.post {
@@ -63,7 +64,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                 speak("জী বলুন কি সহায়তা করবো")
             }
         }
-        mainHandler.postDelayed(watchdogRunnable, 5000)
+        mainHandler.postDelayed(micWatchdog, 4000)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -94,33 +95,20 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts?.setLanguage(Locale("bn", "BD"))
-            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {
-                    isSpeaking = true
-                    lastActivityTime = System.currentTimeMillis()
-                }
-                override fun onDone(utteranceId: String?) {
-                    isSpeaking = false
-                    lastActivityTime = System.currentTimeMillis()
-                    // স্যামসাং ফোনে অডিও রিলিজ হওয়ার জন্য ১২০০ মিলিসেকেন্ড বিরতি
-                    mainHandler.postDelayed({ startListening() }, 1200)
-                }
-                override fun onError(utteranceId: String?) {
-                    isSpeaking = false
-                    mainHandler.postDelayed({ startListening() }, 1200)
-                }
-            })
             speak("জারভিস চালু হয়েছে")
+        } else {
+            updateUI("TTS ত্রুটি: ফোনের সেটিংস চেক করুন")
+            startListening()
         }
     }
 
     private fun speak(text: String) {
         isSpeaking = true
-        lastActivityTime = System.currentTimeMillis()
         updateUI("জারভিস বলছে: $text")
+
         mainHandler.post {
             try {
-                speechRecognizer?.stopListening()
+                speechRecognizer?.cancel()
                 speechRecognizer?.destroy()
                 speechRecognizer = null
             } catch (_: Exception) {}
@@ -128,32 +116,70 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             val params = Bundle()
             params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "jarvis_speech")
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "jarvis_speech")
+            waitForSpeechToFinish()
+        }
+    }
+
+    private fun waitForSpeechToFinish() {
+        mainHandler.postDelayed(object : Runnable {
+            override fun run() {
+                if (tts?.isSpeaking == true) {
+                    mainHandler.postDelayed(this, 300)
+                } else {
+                    val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    am.abandonAudioFocus(null)
+                    isSpeaking = false
+                    mainHandler.postDelayed({ startListening() }, 700)
+                }
+            }
+        }, 500)
+    }
+
+    // স্যামসাংয়ের জাপানিজ ইঞ্জিন বাদ দিয়ে সরাসরি গুগলের ভয়েস ইঞ্জিন খুঁজে বের করার ফাংশন
+    private fun createGoogleSpeechRecognizer(): SpeechRecognizer {
+        val pm = packageManager
+        val services = pm.queryIntentServices(Intent(RecognitionService.SERVICE_INTERFACE), 0)
+        val googleService = services.firstOrNull {
+            it.serviceInfo.packageName.contains("google", ignoreCase = true)
+        }
+        return if (googleService != null) {
+            val component = ComponentName(googleService.serviceInfo.packageName, googleService.serviceInfo.name)
+            SpeechRecognizer.createSpeechRecognizer(this, component)
+        } else {
+            SpeechRecognizer.createSpeechRecognizer(this)
         }
     }
 
     private fun startListening() {
-        if (isSpeaking) return
-        lastActivityTime = System.currentTimeMillis()
+        if (isSpeaking || tts?.isSpeaking == true) return
+        lastMicStartTime = System.currentTimeMillis()
 
         mainHandler.post {
             try {
+                speechRecognizer?.cancel()
                 speechRecognizer?.destroy()
-                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this@JarvisService)
+
+                speechRecognizer = createGoogleSpeechRecognizer()
                 speechRecognizer?.setRecognitionListener(object : RecognitionListener {
                     override fun onReadyForSpeech(params: Bundle?) {
-                        lastActivityTime = System.currentTimeMillis()
+                        lastMicStartTime = System.currentTimeMillis()
                         val mode = if (isAwaitingCommand) "এখন আপনার কমান্ড বলুন..." else "'জারভিস' বলে ডাকুন..."
                         updateUI("মাইক্রোফোন শুনছে ($mode)")
                     }
+
                     override fun onBeginningOfSpeech() {
-                        lastActivityTime = System.currentTimeMillis()
+                        lastMicStartTime = System.currentTimeMillis()
+                        updateUI("আপনি কথা বলছেন...")
                     }
+
                     override fun onRmsChanged(rmsdB: Float) {}
                     override fun onBufferReceived(buffer: ByteArray?) {}
-                    override fun onEndOfSpeech() {}
+                    override fun onEndOfSpeech() {
+                        updateUI("কথা প্রসেস হচ্ছে...")
+                    }
 
                     override fun onPartialResults(partialResults: Bundle?) {
-                        lastActivityTime = System.currentTimeMillis()
+                        lastMicStartTime = System.currentTimeMillis()
                         val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         val text = matches?.firstOrNull()?.trim() ?: ""
                         if (text.isNotEmpty()) {
@@ -164,19 +190,21 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                     override fun onEvent(eventType: Int, params: Bundle?) {}
 
                     override fun onError(error: Int) {
-                        lastActivityTime = System.currentTimeMillis()
+                        lastMicStartTime = System.currentTimeMillis()
                         if (!isSpeaking) {
-                            mainHandler.postDelayed({ startListening() }, 1000)
+                            updateUI("আবার শুনছি (Status: $error)...")
+                            mainHandler.postDelayed({ startListening() }, 800)
                         }
                     }
 
                     override fun onResults(results: Bundle?) {
-                        lastActivityTime = System.currentTimeMillis()
+                        lastMicStartTime = System.currentTimeMillis()
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        val spokenText = matches?.firstOrNull()?.trim() ?: ""
-                        if (spokenText.isNotEmpty()) {
-                            updateUI("আপনি বলেছেন: $spokenText")
-                            handleSpokenText(spokenText)
+                        val allMatchedText = matches?.joinToString(" ")?.trim() ?: ""
+                        val primaryText = matches?.firstOrNull()?.trim() ?: ""
+                        if (primaryText.isNotEmpty()) {
+                            updateUI("আপনি বলেছেন: $primaryText")
+                            handleSpokenText(primaryText, allMatchedText)
                         } else {
                             mainHandler.postDelayed({ startListening() }, 500)
                         }
@@ -186,25 +214,29 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                 val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "bn-BD")
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
                 }
                 speechRecognizer?.startListening(intent)
             } catch (e: Exception) {
-                updateUI("মাইক্রোফোন রিস্টার্ট হচ্ছে...")
+                updateUI("মাইক্রোফোন ত্রুটি: ${e.message}")
                 mainHandler.postDelayed({ startListening() }, 1500)
             }
         }
     }
 
-    private fun handleSpokenText(text: String) {
-        val lower = text.lowercase()
-        val wakeWords = listOf("জার্ভিস", "জারভিস", "যারভিস", "জারবিস", "সার্ভিস", "ভিস", "jarvis", "service")
-        val hasWakeWord = wakeWords.any { lower.contains(it) }
+    private fun handleSpokenText(primaryText: String, allText: String) {
+        val checkText = allText.lowercase()
+        val wakeWords = listOf(
+            "জার্ভিস", "জারভিস", "যারভিস", "জারবিস", "সার্ভিস", "সারভিস",
+            "জার্ভিজ", "জারভিজ", "ভিস", "jarvis", "service", "zarvis", "jarbis"
+        )
+        val hasWakeWord = wakeWords.any { checkText.contains(it) }
 
         if (!isAwaitingCommand) {
             if (hasWakeWord) {
-                var cleanedCommand = lower
+                var cleanedCommand = primaryText.lowercase()
                 wakeWords.forEach { cleanedCommand = cleanedCommand.replace(it, "") }
                 cleanedCommand = cleanedCommand.replace("হ্যালো", "").replace("এই", "").trim()
 
@@ -219,7 +251,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             }
         } else {
             isAwaitingCommand = false
-            processCommandWithGemini(text)
+            processCommandWithGemini(primaryText)
         }
     }
 
@@ -313,7 +345,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                 }
                 "CALL" -> {
                     if (target.isNotEmpty()) {
-                        val i = Intent(Intent.ACTION_CALL, Uri.parse("tel:$target")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        val i = Intent.ACTION_CALL.let { Intent(it, Uri.parse("tel:$target")) }.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         startActivity(i)
                     }
                 }
@@ -347,7 +379,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onDestroy() {
-        mainHandler.removeCallbacks(watchdogRunnable)
+        mainHandler.removeCallbacks(micWatchdog)
         wakeLock?.release()
         speechRecognizer?.destroy()
         tts?.shutdown()
