@@ -42,7 +42,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private var wakeLock: PowerManager.WakeLock? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    @Volatile private var isServiceRunning = false
+    @Volatile private var isLoopActive = false
     @Volatile private var isSpeaking = false
     @Volatile private var isProcessing = false
     @Volatile private var isAwaitingCommand = false
@@ -51,7 +51,6 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         super.onCreate()
         startNotification()
         acquireWakeLock()
-        isServiceRunning = true
         tts = TextToSpeech(this, this, "com.google.android.tts")
 
         triggerDirectCommand = {
@@ -61,8 +60,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!isServiceRunning) {
-            isServiceRunning = true
+        if (!isLoopActive) {
             startRawAudioLoop()
         }
         return START_STICKY
@@ -93,9 +91,10 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         if (status == TextToSpeech.SUCCESS) {
             tts?.setLanguage(Locale("bn", "BD"))
             speak("জারভিস চালু হয়েছে")
-            startRawAudioLoop()
         } else {
             updateUI("TTS ত্রুটি: সেটিংস চেক করুন")
+        }
+        if (!isLoopActive) {
             startRawAudioLoop()
         }
     }
@@ -118,16 +117,16 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                     mainHandler.postDelayed(this, 300)
                 } else {
                     isSpeaking = false
-                    val mode = if (isAwaitingCommand) "এখন আপনার কমান্ড বলুন..." else "'জারভিস' বলে ডাকুন..."
-                    updateUI("মাইক্রোফোন শুনছে ($mode)")
                 }
             }
         }, 600)
     }
 
-    // সরাসরি মাইক্রোফোন থেকে আওয়াজ শোনার লুপ (Samsung S23 Ultra-তে ১০০% কাজ করবে)
     @SuppressLint("MissingPermission")
     private fun startRawAudioLoop() {
+        if (isLoopActive) return
+        isLoopActive = true
+
         thread {
             val sampleRate = 16000
             val bufferSize = AudioRecord.getMinBufferSize(
@@ -139,73 +138,86 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             var recorder: AudioRecord? = null
             try {
                 recorder = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
                     sampleRate,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
+                    bufferSize * 2
                 )
+
+                if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+                    updateUI("মাইক্রোফোন চালু হতে পারেনি! অ্যাপ রিস্টার্ট করুন।")
+                    isLoopActive = false
+                    return@thread
+                }
+
                 recorder.startRecording()
 
-                val buffer = ShortArray(1600) // প্রতি ১০০ মিলিসেকেন্ডের অডিও বাফার
+                val buffer = ShortArray(1600)
                 val speechOutput = ByteArrayOutputStream()
                 var isRecordingVoice = false
                 var silenceChunks = 0
                 var voiceChunks = 0
+                var uiCounter = 0
 
-                while (isServiceRunning) {
+                while (isLoopActive) {
+                    val read = recorder.read(buffer, 0, buffer.size)
+                    if (read <= 0) continue
+
+                    // কথা বলা বা প্রসেসিং চলাকালীন মাইক্রোফোনের বাফার ক্লিয়ার রাখা হচ্ছে
                     if (isSpeaking || isProcessing || tts?.isSpeaking == true) {
                         speechOutput.reset()
                         isRecordingVoice = false
                         silenceChunks = 0
                         voiceChunks = 0
-                        Thread.sleep(200)
                         continue
                     }
 
-                    val read = recorder.read(buffer, 0, buffer.size)
-                    if (read > 0) {
-                        var sum = 0.0
-                        for (i in 0 until read) {
-                            sum += buffer[i] * buffer[i]
+                    var sum = 0.0
+                    for (i in 0 until read) {
+                        val s = buffer[i].toDouble()
+                        sum += s * s
+                    }
+                    val rms = sqrt(sum / read).toInt()
+
+                    // শব্দের মাত্রা ২৫০ পার হলেই কথা রেকর্ড শুরু হবে
+                    if (rms > 250) {
+                        if (!isRecordingVoice) {
+                            isRecordingVoice = true
+                            speechOutput.reset()
+                            voiceChunks = 0
                         }
-                        val rms = sqrt(sum / read)
+                        silenceChunks = 0
+                        voiceChunks++
+                        writeShortsToBytes(buffer, read, speechOutput)
+                        updateUI("আপনার কথা রেকর্ড হচ্ছে... (শব্দের মাত্রা: $rms)")
+                    } else if (isRecordingVoice) {
+                        silenceChunks++
+                        writeShortsToBytes(buffer, read, speechOutput)
 
-                        // আপনি কথা বললেই কণ্ঠের তীব্রতা (RMS > 450) ধরা পড়বে
-                        if (rms > 450) {
-                            if (!isRecordingVoice) {
-                                isRecordingVoice = true
-                                speechOutput.reset()
-                                voiceChunks = 0
-                                updateUI("আপনার কথা রেকর্ড হচ্ছে...")
+                        // কথা বলা শেষ করে ১ সেকেন্ড থামলে অডিও পাঠানো হবে
+                        if (silenceChunks > 10 || voiceChunks > 45) {
+                            isRecordingVoice = false
+                            val pcmBytes = speechOutput.toByteArray()
+                            speechOutput.reset()
+
+                            if (voiceChunks >= 3) {
+                                val wavBytes = addWavHeader(pcmBytes, sampleRate)
+                                processAudioWithGemini(wavBytes)
                             }
-                            silenceChunks = 0
-                            voiceChunks++
-                            writeShortsToBytes(buffer, read, speechOutput)
-                        } else if (isRecordingVoice) {
-                            silenceChunks++
-                            writeShortsToBytes(buffer, read, speechOutput)
-
-                            // কথা বলা শেষ করে ১.২ সেকেন্ড থামলে বা ৫ সেকেন্ড পূর্ণ হলে প্রসেস করবে
-                            if (silenceChunks > 12 || voiceChunks > 50) {
-                                isRecordingVoice = false
-                                val pcmBytes = speechOutput.toByteArray()
-                                speechOutput.reset()
-
-                                if (voiceChunks >= 3) {
-                                    val wavBytes = addWavHeader(pcmBytes, sampleRate)
-                                    processAudioWithGemini(wavBytes)
-                                } else {
-                                    val mode = if (isAwaitingCommand) "এখন আপনার কমান্ড বলুন..." else "'জারভিস' বলে ডাকুন..."
-                                    updateUI("মাইক্রোফোন শুনছে ($mode)")
-                                }
-                            }
+                        }
+                    } else {
+                        uiCounter++
+                        if (uiCounter % 5 == 0) {
+                            val mode = if (isAwaitingCommand) "এখন কমান্ড বলুন" else "'জারভিস' বলে ডাকুন"
+                            updateUI("মাইক্রোফোন শুনছে [$mode] (শব্দের মাত্রা: $rms)")
                         }
                     }
                 }
             } catch (e: Exception) {
                 updateUI("মাইক্রোফোন ত্রুটি: ${e.message}")
             } finally {
+                isLoopActive = false
                 try {
                     recorder?.stop()
                     recorder?.release()
@@ -232,8 +244,8 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         header.put("WAVE".toByteArray(Charsets.US_ASCII))
         header.put("fmt ".toByteArray(Charsets.US_ASCII))
         header.putInt(16)
-        header.putShort(1.toShort()) // PCM
-        header.putShort(1.toShort()) // Mono
+        header.putShort(1.toShort())
+        header.putShort(1.toShort())
         header.putInt(sampleRate)
         header.putInt(byteRate)
         header.putShort(2.toShort())
@@ -275,7 +287,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                    {"status": "WAKE_ONLY", "action": "NONE", "target": "", "reply": "জী বলুন কি সহায়তা করবো"}
                 2. If the user called "Jarvis" AND gave a command (or if the audio is a clear command in Bangla), execute it:
                    {"status": "COMMAND", "action": "FLASH_ON|FLASH_OFF|VOLUME_UP|VOLUME_DOWN|WIFI_SETTINGS|CALL|OPEN_APP|NONE", "target": "phone number or English app name if needed", "reply": "Short helpful reply in Bangla"}
-                3. If the audio is just background noise or unrelated speech not directed at Jarvis, return:
+                3. If the audio is just background noise or unrelated speech, return:
                    {"status": "IGNORE", "action": "NONE", "target": "", "reply": ""}
                 """.trimIndent()
             } else {
@@ -339,14 +351,11 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                         executePhoneAction(action, target)
                         if (reply.isNotEmpty()) speak(reply)
                     }
-                    else -> {
-                        updateUI("মাইক্রোফোন শুনছে ('জারভিস' বলে ডাকুন...)")
-                    }
                 }
             }
         } catch (e: Exception) {
             isProcessing = false
-            updateUI("সংযোগ ত্রুটি: ${e.message}")
+            updateUI("ত্রুটি: ${e.message}")
         }
     }
 
@@ -397,7 +406,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onDestroy() {
-        isServiceRunning = false
+        isLoopActive = false
         wakeLock?.release()
         tts?.shutdown()
         super.onDestroy()
