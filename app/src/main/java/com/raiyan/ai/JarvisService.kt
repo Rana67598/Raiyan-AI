@@ -22,6 +22,17 @@ import kotlin.concurrent.thread
 
 class JarvisService : Service(), TextToSpeech.OnInitListener {
 
+    companion object {
+        var logCallback: ((String) -> Unit)? = null
+        var triggerDirectCommand: (() -> Unit)? = null
+
+        fun updateUI(msg: String) {
+            Handler(Looper.getMainLooper()).post {
+                logCallback?.invoke(msg)
+            }
+        }
+    }
+
     private var speechRecognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -34,7 +45,18 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         startNotification()
         acquireWakeLock()
         tts = TextToSpeech(this, this)
+
+        triggerDirectCommand = {
+            mainHandler.post {
+                isAwaitingCommand = true
+                speak("জী বলুন কি সহায়তা করবো")
+            }
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         mainHandler.post { initSpeechRecognizer() }
+        return START_STICKY
     }
 
     private fun startNotification() {
@@ -60,58 +82,82 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            tts?.language = Locale("bn", "BD")
+            tts?.setLanguage(Locale("bn", "BD"))
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) { isSpeaking = true }
                 override fun onDone(utteranceId: String?) {
                     isSpeaking = false
-                    mainHandler.postDelayed({ startListening() }, 400)
+                    mainHandler.postDelayed({ startListening() }, 500)
                 }
                 override fun onError(utteranceId: String?) {
                     isSpeaking = false
-                    mainHandler.postDelayed({ startListening() }, 400)
+                    mainHandler.postDelayed({ startListening() }, 500)
                 }
             })
+            speak("জারভিস চালু হয়েছে")
         }
     }
 
     private fun speak(text: String) {
         isSpeaking = true
-        mainHandler.post { speechRecognizer?.cancel() }
-        val params = Bundle()
-        params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "jarvis_speech")
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "jarvis_speech")
+        updateUI("জারভিস বলছে: $text")
+        mainHandler.post {
+            try { speechRecognizer?.cancel() } catch (_: Exception) {}
+            val params = Bundle()
+            params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "jarvis_speech")
+            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "jarvis_speech")
+        }
     }
 
     private fun initSpeechRecognizer() {
-        speechRecognizer?.destroy()
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
-        speechRecognizer?.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
-            override fun onPartialResults(partialResults: Bundle?) {}
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-
-            override fun onError(error: Int) {
-                if (!isSpeaking) {
-                    mainHandler.postDelayed({ startListening() }, 800)
+        try {
+            speechRecognizer?.destroy()
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+            speechRecognizer?.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {
+                    val mode = if (isAwaitingCommand) "এখন আপনার কমান্ড বলুন..." else "'জারভিস' বলে ডাকুন..."
+                    updateUI("মাইক্রোফোন শুনছে ($mode)")
                 }
-            }
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() {}
 
-            override fun onResults(results: Bundle?) {
-                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                val spokenText = matches?.firstOrNull()?.trim() ?: ""
-                if (spokenText.isNotEmpty()) {
-                    handleSpokenText(spokenText)
-                } else {
-                    startListening()
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val text = matches?.firstOrNull()?.trim() ?: ""
+                    if (text.isNotEmpty()) {
+                        updateUI("শুনতে পাচ্ছি: $text")
+                    }
                 }
-            }
-        })
-        startListening()
+
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+
+                override fun onError(error: Int) {
+                    if (!isSpeaking) {
+                        if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT) {
+                            mainHandler.postDelayed({ initSpeechRecognizer() }, 1000)
+                        } else {
+                            mainHandler.postDelayed({ startListening() }, 600)
+                        }
+                    }
+                }
+
+                override fun onResults(results: Bundle?) {
+                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val spokenText = matches?.firstOrNull()?.trim() ?: ""
+                    if (spokenText.isNotEmpty()) {
+                        updateUI("আপনি বলেছেন: $spokenText")
+                        handleSpokenText(spokenText)
+                    } else {
+                        startListening()
+                    }
+                }
+            })
+            startListening()
+        } catch (e: Exception) {
+            updateUI("মাইক্রোফোন সমস্যা: ${e.message}")
+        }
     }
 
     private fun startListening() {
@@ -119,27 +165,28 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         }
         try {
             speechRecognizer?.startListening(intent)
         } catch (e: Exception) {
-            mainHandler.postDelayed({ startListening() }, 1000)
+            mainHandler.postDelayed({ initSpeechRecognizer() }, 1000)
         }
     }
 
     private fun handleSpokenText(text: String) {
         val lower = text.lowercase()
-        val hasWakeWord = lower.contains("জার্ভিস") || lower.contains("জারভিস") || lower.contains("যারভিস") || lower.contains("ভিস") || lower.contains("jarvis")
+        val wakeWords = listOf("জার্ভিস", "জারভিস", "যারভিস", "জারবিস", "সার্ভিস", "ভিস", "jarvis", "service")
+        val hasWakeWord = wakeWords.any { lower.contains(it) }
 
         if (!isAwaitingCommand) {
             if (hasWakeWord) {
-                val cleanedCommand = lower
-                    .replace("জারভিস", "")
-                    .replace("যারভিস", "")
-                    .replace("jarvis", "")
-                    .trim()
+                var cleanedCommand = lower
+                wakeWords.forEach { cleanedCommand = cleanedCommand.replace(it, "") }
+                cleanedCommand = cleanedCommand.replace("হ্যালো", "").replace("এই", "").trim()
 
-                if (cleanedCommand.length > 2) {
+                // শুধু ডাকলে আগে সাড়া দেবে, আর বড় কমান্ড একসাথে বললে সরাসরি কাজ করবে
+                if (cleanedCommand.length > 6) {
                     processCommandWithGemini(cleanedCommand)
                 } else {
                     isAwaitingCommand = true
@@ -155,11 +202,14 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun processCommandWithGemini(command: String) {
-        val apiKey = getSharedPreferences("RaiyanPrefs", Context.MODE_PRIVATE).getString("API_KEY", "") ?: ""
+        val rawKey = getSharedPreferences("RaiyanPrefs", Context.MODE_PRIVATE).getString("API_KEY", "") ?: ""
+        val apiKey = rawKey.replace("\\s".toRegex(), "")
         if (apiKey.isEmpty()) {
             speak("দয়া করে রাইয়ান অ্যাপে আপনার এপিআই কি বসান")
             return
         }
+
+        updateUI("জারভিস চিন্তা করছে: '$command'...")
 
         thread {
             try {
@@ -167,30 +217,49 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                 val conn = url.openConnection() as HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json")
+                conn.connectTimeout = 15000
+                conn.readTimeout = 15000
                 conn.doOutput = true
 
                 val systemPrompt = """
                     You are Jarvis, a Bangla voice assistant inside the Android app Raiyan.
-                    Respond ONLY in raw JSON format without markdown blocks:
-                    {"action": "FLASH_ON|FLASH_OFF|VOLUME_UP|VOLUME_DOWN|WIFI_SETTINGS|CALL|OPEN_APP|NONE", "target": "phone number or app name in English if needed", "reply": "Short natural response in Bangla"}
-                    User command: $command
+                    Return ONLY a valid JSON object with these keys:
+                    {"action": "FLASH_ON or FLASH_OFF or VOLUME_UP or VOLUME_DOWN or WIFI_SETTINGS or CALL or OPEN_APP or NONE", "target": "phone number or English app name if needed, else empty", "reply": "Short helpful reply in Bangla"}
+                    User command in Bangla: $command
                 """.trimIndent()
 
                 val body = JSONObject().apply {
                     put("contents", JSONArray().put(JSONObject().apply {
                         put("parts", JSONArray().put(JSONObject().put("text", systemPrompt)))
                     }))
+                    put("generationConfig", JSONObject().apply {
+                        put("responseMimeType", "application/json")
+                    })
                 }
 
-                conn.outputStream.use { it.write(body.toString().toByteArray()) }
+                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+
+                val responseCode = conn.responseCode
+                if (responseCode != 200) {
+                    val errorStream = conn.errorStream?.bufferedReader()?.readText() ?: "HTTP $responseCode"
+                    mainHandler.post {
+                        updateUI("API Error ($responseCode): $errorStream")
+                        speak("আপনার এপিআই কি সঠিক নয় অথবা মেয়াদ শেষ হয়েছে")
+                    }
+                    return@thread
+                }
+
                 val responseText = conn.inputStream.bufferedReader().readText()
                 val rawReply = JSONObject(responseText)
                     .getJSONArray("candidates").getJSONObject(0)
                     .getJSONObject("content").getJSONArray("parts")
-                    .getJSONObject(0).getString("text")
-                    .replace("```json", "").replace("```", "").trim()
+                    .getJSONObject(0).getString("text").trim()
 
-                val resultJson = JSONObject(rawReply)
+                val jsonStart = rawReply.indexOf("{")
+                val jsonEnd = rawReply.lastIndexOf("}")
+                val cleanJson = if (jsonStart != -1 && jsonEnd != -1) rawReply.substring(jsonStart, jsonEnd + 1) else rawReply
+
+                val resultJson = JSONObject(cleanJson)
                 val action = resultJson.optString("action", "NONE")
                 val target = resultJson.optString("target", "")
                 val reply = resultJson.optString("reply", "ঠিক আছে")
@@ -200,7 +269,10 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                     speak(reply)
                 }
             } catch (e: Exception) {
-                mainHandler.post { speak("দুঃখিত, ইন্টারনেট বা এপিআই সংযোগে সমস্যা হচ্ছে") }
+                mainHandler.post {
+                    updateUI("সমস্যার কারণ: ${e.message}")
+                    speak("দুঃখিত, ইন্টারনেট বা এপিআই সংযোগে সমস্যা হচ্ছে")
+                }
             }
         }
     }
