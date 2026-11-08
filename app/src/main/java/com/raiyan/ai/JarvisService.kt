@@ -90,7 +90,10 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts?.setLanguage(Locale("bn", "BD"))
-            speak("জারভিস চালু হয়েছে")
+            // অ্যাপ চালু হওয়ার সময় আটকে থাকা রোধ করতে একটু ডিলে করে প্রথম কথা বলা হচ্ছে
+            mainHandler.postDelayed({
+                speak("জারভিস চালু হয়েছে")
+            }, 1000)
         } else {
             updateUI("TTS ত্রুটি: সেটিংস চেক করুন")
         }
@@ -117,9 +120,10 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                     mainHandler.postDelayed(this, 300)
                 } else {
                     isSpeaking = false
+                    updateUI("মাইক্রোফোন সচল আছে, কথা বলুন...")
                 }
             }
-        }, 600)
+        }, 500)
     }
 
     @SuppressLint("MissingPermission")
@@ -146,30 +150,30 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                 )
 
                 if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-                    updateUI("মাইক্রোফোন চালু হতে পারেনি! অ্যাপ রিস্টার্ট করুন।")
+                    updateUI("মাইক্রোফোন ইনিশিয়ালাইজ হয়নি!")
                     isLoopActive = false
                     return@thread
                 }
 
                 recorder.startRecording()
+                updateUI("মাইক্রোফোন শুনছে... কথা বলুন")
 
                 val buffer = ShortArray(1600)
                 val speechOutput = ByteArrayOutputStream()
                 var isRecordingVoice = false
                 var silenceChunks = 0
                 var voiceChunks = 0
-                var uiCounter = 0
 
                 while (isLoopActive) {
                     val read = recorder.read(buffer, 0, buffer.size)
                     if (read <= 0) continue
 
-                    // কথা বলা বা প্রসেসিং চলাকালীন মাইক্রোফোনের বাফার ক্লিয়ার রাখা হচ্ছে
                     if (isSpeaking || isProcessing || tts?.isSpeaking == true) {
                         speechOutput.reset()
                         isRecordingVoice = false
                         silenceChunks = 0
                         voiceChunks = 0
+                        Thread.sleep(150)
                         continue
                     }
 
@@ -180,8 +184,8 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                     }
                     val rms = sqrt(sum / read).toInt()
 
-                    // শব্দের মাত্রা ২৫০ পার হলেই কথা রেকর্ড শুরু হবে
-                    if (rms > 250) {
+                    // শব্দের মাত্রা ৩০০ পার হলেই ভয়েস ক্যাপচার শুরু করবে
+                    if (rms > 300) {
                         if (!isRecordingVoice) {
                             isRecordingVoice = true
                             speechOutput.reset()
@@ -190,12 +194,11 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                         silenceChunks = 0
                         voiceChunks++
                         writeShortsToBytes(buffer, read, speechOutput)
-                        updateUI("আপনার কথা রেকর্ড হচ্ছে... (শব্দের মাত্রা: $rms)")
                     } else if (isRecordingVoice) {
                         silenceChunks++
                         writeShortsToBytes(buffer, read, speechOutput)
 
-                        // কথা বলা শেষ করে ১ সেকেন্ড থামলে অডিও পাঠানো হবে
+                        // কথা বলা শেষ হলে এপিআই-তে পাঠাবে
                         if (silenceChunks > 10 || voiceChunks > 45) {
                             isRecordingVoice = false
                             val pcmBytes = speechOutput.toByteArray()
@@ -206,16 +209,10 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                                 processAudioWithGemini(wavBytes)
                             }
                         }
-                    } else {
-                        uiCounter++
-                        if (uiCounter % 5 == 0) {
-                            val mode = if (isAwaitingCommand) "এখন কমান্ড বলুন" else "'জারভিস' বলে ডাকুন"
-                            updateUI("মাইক্রোফোন শুনছে [$mode] (শব্দের মাত্রা: $rms)")
-                        }
                     }
                 }
             } catch (e: Exception) {
-                updateUI("মাইক্রোফোন ত্রুটি: ${e.message}")
+                updateUI("লুপ ত্রুটি: ${e.message}")
             } finally {
                 isLoopActive = false
                 try {
@@ -268,7 +265,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         }
 
         isProcessing = true
-        updateUI("জারভিস আপনার কথা বিশ্লেষণ করছে...")
+        updateUI("জারভিস চিন্তা করছে...")
 
         try {
             val base64Audio = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
@@ -282,19 +279,18 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
 
             val modePrompt = if (!isAwaitingCommand) {
                 """
-                Listen to the user's audio carefully.
-                1. If the user ONLY called the wake word ("Jarvis", "জারভিস", "জার্ভিস", "সার্ভিস") without a specific command, return:
+                Listen to the audio.
+                1. If the user only said the wake word ("Jarvis", "জারভিস", "জার্ভিস", "সার্ভিস"), return:
                    {"status": "WAKE_ONLY", "action": "NONE", "target": "", "reply": "জী বলুন কি সহায়তা করবো"}
-                2. If the user called "Jarvis" AND gave a command (or if the audio is a clear command in Bangla), execute it:
-                   {"status": "COMMAND", "action": "FLASH_ON|FLASH_OFF|VOLUME_UP|VOLUME_DOWN|WIFI_SETTINGS|CALL|OPEN_APP|NONE", "target": "phone number or English app name if needed", "reply": "Short helpful reply in Bangla"}
-                3. If the audio is just background noise or unrelated speech, return:
+                2. If the user said Jarvis AND gave a command, return:
+                   {"status": "COMMAND", "action": "FLASH_ON|FLASH_OFF|VOLUME_UP|VOLUME_DOWN|WIFI_SETTINGS|CALL|OPEN_APP|NONE", "target": "phone number or English app name", "reply": "Short reply in Bangla"}
+                3. Otherwise, return:
                    {"status": "IGNORE", "action": "NONE", "target": "", "reply": ""}
                 """.trimIndent()
             } else {
                 """
-                The user is giving a direct command in Bangla after waking Jarvis.
-                Return ONLY a valid JSON object:
-                {"status": "COMMAND", "action": "FLASH_ON|FLASH_OFF|VOLUME_UP|VOLUME_DOWN|WIFI_SETTINGS|CALL|OPEN_APP|NONE", "target": "phone number or English app name if needed", "reply": "Short helpful reply in Bangla"}
+                The user gave a command in Bangla. Return ONLY a valid JSON object:
+                {"status": "COMMAND", "action": "FLASH_ON|FLASH_OFF|VOLUME_UP|VOLUME_DOWN|WIFI_SETTINGS|CALL|OPEN_APP|NONE", "target": "phone number or English app name", "reply": "Short reply in Bangla"}
                 """.trimIndent()
             }
 
@@ -318,7 +314,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             val responseCode = conn.responseCode
             if (responseCode != 200) {
                 val err = conn.errorStream?.bufferedReader()?.readText() ?: "HTTP $responseCode"
-                updateUI("API Error ($responseCode): $err")
+                updateUI("API Error: $err")
                 isProcessing = false
                 return
             }
